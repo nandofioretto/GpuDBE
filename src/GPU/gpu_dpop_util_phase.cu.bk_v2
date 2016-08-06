@@ -1,0 +1,731 @@
+// CUDA and CUBLAS functions
+// CUDA runtime
+#include <cuda_runtime.h>
+
+// Utilities and system includes
+#include <assert.h>
+#include <helper_string.h>  // helper for shared functions common to CUDA Samples
+#include <helper_functions.h>
+#include <helper_cuda.h>
+
+#include <vector>
+#include <string>
+#include <iostream>
+#include <limits>       // std::numeric_limits
+#include <cmath>       /* ceil */
+#include <math_functions.h>
+#include <cuda_profiler_api.h>
+
+#include "GPU/gpu_dpop_util_phase.hh"
+#include "GPU/gpu_globals.hh"
+#include "GPU/gpu_data_allocator.hh"
+#include "GPU/cuda_utils.hh"
+#include "GPU/cuda_dpop_state.hh"
+
+#include "Kernel/types.hh"
+
+//#define VERBOSE
+
+using namespace CUDA;
+
+__global__ void compute_util_table_ver_0(int* utilTable,
+		unsigned int block_shift,
+		unsigned int nb_util_table_rows,  // after projection
+		int nbGroups, // each group computes a row (nb_worlds)
+		int aid, int d_size, int nb_var_sep,
+		int nb_binary);
+
+__global__ void compute_util_table_ver_1(int* utilTable, int** childUtilTable,
+		unsigned int block_shift,
+		unsigned int nb_util_table_rows,  // after projection
+		int nbGroups, // each group computes a row (nb_worlds)
+		int aid, int d_size, int nb_var_sep,
+		int max_ch_sep_size, int nb_binary, int children_info_size,
+		bool is_root);
+
+__global__ void compute_util_table_ver_2(int* devUtilTable,
+		unsigned int blockShift,
+		unsigned int utilTableSize,  // size after projection
+		int aid, int domSize, int nbVarSep,
+		int nbBinary);
+
+__global__ void printArray(int** array, int id, unsigned int nRows, int nCols) {
+	printf("Table nRwos=%d, nCols=%d\n", nRows, nCols);
+
+	int limit = nRows > 50 ? 10 : nRows;
+	for (int r = 0; r < limit; r++) {
+		for (int c = 0; c < nCols; c++) {
+			printf("%d ", array[id][r * nCols + c]);
+		}
+		printf("\n");
+	}
+}
+
+__global__ void associateVector(int** array2d, int id, int* array) {
+	array2d[id] = array;
+}
+
+// _version_ = 0  (tree-leaves)
+//                uses directly projected table, and optimizes values for the 
+//                domain of the current variable on GPU
+//
+// _version_ = 1  (if it can copy all children table in global memory)
+//                uses directly projected table, and optimizes values for the 
+//                domain of the current variable on GPU
+//                - A thread operates in a single world (and all domain elements of this agent)
+//                - A group  operates on a row of the UTIL table
+//                - n groups (based on 256 threads)
+//
+// _version_ = 2  (when children table cannot fit= in global memory)
+//                Computes only binary constraints on GPU and operates onto unprojected table. 
+//                - A thread operates  all worlds, on a given combinaion of values of the separator set 
+//                 (excluding thus current variable).
+//                - Groups = Threads (256)
+//                - Children are added on CPU
+//                - Projection and Optimization is made on CPU
+//            
+// _version_ = 3  (when children table cannot fit in global memory) 
+//                Computes only binary constraints on GPU and operates onto unprojected table. 
+//                For a given combinaion of values of the separator set (excluding thus 
+//                current variable), a thread manages all worlds and all values of the domain 
+//                of the current variable. 
+//                Children are added on CPU
+//                Projection and Optimization is made on CPU
+//
+void GPU_DPOPutilPhase::compute_util_table(DPOPstate& dpop_state, int _version_,
+					   size_t& gpu_time_us) {
+
+  int nAgents = dpop_state.get_nb_dcop_agents();
+
+  // NOTE: Based on the version let the DPOP_state create a table of appropriate size.
+  size_t nbUtilTableRows = dpop_state.getUtilTableRows(); // before projection
+  size_t nbUtilTableRowsAfterProj = dpop_state.getUtilTableRowsAfterProj();
+  
+  // ----------------------------------------------------------------------- //
+  // GPU Device Setup
+  // ----------------------------------------------------------------------- //
+  size_t nbThreads = 64;  // Number of Parallel Threads per SM
+  size_t nbGroups; // groups of threads
+  size_t nbBlocks;
+  size_t devPitch = 512;
+  if (_version_ == 0 || _version_ == 1) {
+    nbGroups = nbThreads;   // One group for each row of the utility table
+    nbBlocks =
+      (nbUtilTableRowsAfterProj % nbGroups == 0) ?
+      (nbUtilTableRowsAfterProj / nbGroups) :
+      (nbUtilTableRowsAfterProj / nbGroups) + 1;
+  } else if (_version_ == 2 || _version_ == 3) {
+    nbGroups = nbThreads;
+    //nbBlocks  = nbUtilTableRows;
+    nbBlocks =
+      (nbUtilTableRowsAfterProj % nbGroups == 0) ?
+      (nbUtilTableRowsAfterProj / nbGroups) :
+      (nbUtilTableRowsAfterProj / nbGroups) + 1;
+  }
+  
+  // ----------------------------------------------------------------------- //
+  // Shared memory
+  // ----------------------------------------------------------------------- //
+  int sharedMem = dpop_state.get_nb_binary_constraints() * 3 * sizeof(int); // constraintInfo
+  // if( has_unary )
+  //   shared_mem += nb_worlds * d_size * sizeof(util_t);
+  
+  if (_version_ == 0) {
+    sharedMem += nbGroups * dpop_state.get_separator().size() * sizeof(int); // __sep_values
+  } else if (_version_ == 1) {
+    sharedMem = 0; // rm binary constraints
+    //sharedMem += dpop_state.get_children_info_size() * sizeof(int); // children_info
+    sharedMem += nbGroups * dpop_state.get_separator().size() * sizeof(int); // __sep_values
+    sharedMem += nbThreads * dpop_state.get_max_children_info_size() * sizeof(int); // __sep_value_child
+    sharedMem += nbThreads * dpop_state.get_dom_size() * sizeof(int);
+  } else if (_version_ == 2) {
+    sharedMem += nbThreads * (dpop_state.get_separator().size() + 1) * sizeof(int);  // sepValues
+    sharedMem += nbThreads /* dpop_state.get_nb_worlds() */ * sizeof(int); // worldsUtil
+  }
+  assert(sharedMem <= TOT_SHARED_MEM);
+  
+  printf("[GPU] Agent %d Shared Memory required %zu bytes \n",
+	 dpop_state.get_agent_id(), sharedMem);
+  
+  // ----------------------------------------------------------------------- //
+  // Global memory
+  // ----------------------------------------------------------------------- //
+  int **devChildUtilTable;
+	int **hostChildUtilTableMirror; // the pointers to be copied on the device;
+
+	int *devUtilTable;
+	int *hostUtilTable = dpop_state.getUtilTablePtr();
+
+	size_t cudaFreeMem = CUDAutils::get_nb_bytes_free_global_memory();
+	size_t nBytesHost = 0;
+	size_t nBytesDev = 0;
+	size_t devUtilTableRows = 0;
+
+	if (_version_ == 0) {
+		nBytesHost = nbUtilTableRowsAfterProj * sizeof(int);
+		devUtilTableRows = nbUtilTableRowsAfterProj;
+	} else if (_version_ == 1) {
+		nBytesHost = nbUtilTableRowsAfterProj * sizeof(int);
+		devUtilTableRows = nbUtilTableRowsAfterProj;
+
+		// Add up the aggregated children Table memory and Remove it from CudaFreeMem
+		size_t childrenMem = 0;
+		std::vector<int> childrenId = dpop_state.getChildrenId();
+		for (int i = 0; i < childrenId.size(); i++) {
+			childrenMem += dpop_state.getChildTableRows(childrenId[i]) * sizeof(int);
+			std::cout << "[GPU] Chid " << childrenId[i] << " required Mem: "
+					<< childrenMem / (1024 * 1024) << " MB\n";
+		}
+		cudaFreeMem -= childrenMem;
+	} else if (_version_ == 2 || _version_ == 3) {
+		nBytesHost = nbUtilTableRows * sizeof(int);
+		devUtilTableRows = nbUtilTableRows;
+	}
+	nBytesDev = nBytesHost;
+
+	// We fit on Device whatever we can
+	if (nBytesDev >= cudaFreeMem) {
+		devUtilTableRows = cudaFreeMem / sizeof(int);
+		// ensure it's a multiple of d:
+		int rem = devUtilTableRows % dpop_state.get_dom_size();
+		if (rem != 0)
+			devUtilTableRows -= rem;
+
+		nBytesDev = devUtilTableRows * sizeof(int);
+	}
+
+	if (_version_ == 0 || _version_ == 1)
+		printf(
+				"[GPU] Agent %d Util Table Memory Needed: %zu MB, [%d] free memory %zu MB \n",
+				dpop_state.get_agent_id(), nBytesHost / (1024 * 1024),
+				nbUtilTableRowsAfterProj, cudaFreeMem / (1024 * 1024));
+	else if (_version_ == 2 || _version_ == 3)
+		printf(
+				"[GPU] Agent %d Util Table Memory Needed: %zu MB, [%d] free memory %zu MB \n",
+				dpop_state.get_agent_id(), nBytesHost / (1024 * 1024),
+				nbUtilTableRows, cudaFreeMem / (1024 * 1024));
+
+	checkCudaErrors(cudaMalloc(&devUtilTable, nBytesDev));
+
+	// Copy children Util Table into global memory.
+	// TODO: Important: this need to be done as soon as you receive a table from a children.
+	if (_version_ == 1) {
+		checkCudaErrors(cudaMalloc(&devChildUtilTable, nAgents * sizeof(int*)));
+
+		std::vector<int> childrenId = dpop_state.getChildrenId();
+		hostChildUtilTableMirror = new int*[childrenId.size()];
+
+		// FOR EACH children ID (TODO: USE THRUST here):
+		for (int i = 0; i < childrenId.size(); i++) {
+			int chId = childrenId[i];
+			unsigned int sizeChTable = dpop_state.getChildTableRows(chId) * sizeof(int);
+			int* dev_tmp;
+			checkCudaErrors(cudaMalloc(&dev_tmp, sizeChTable));
+			checkCudaErrors(cudaMemcpy(dev_tmp, dpop_state.getChildTablePtr(chId),
+							sizeChTable, cudaMemcpyHostToDevice));
+			checkCudaErrors(cudaDeviceSynchronize());
+
+			associateVector<<<1,1>>> (devChildUtilTable, chId, dev_tmp);
+			checkCudaErrors(cudaDeviceSynchronize());
+
+			// printf("Print UTIL TABLE copied on Device  for children %d [%d %d]\n", chId,
+			// 	     dpop_state.getChildTableRows( chId ), nbWorlds);
+			// printArray<<<1,1>>>(devChildUtilTable, chId, dpop_state.getChildTableRows( chId ), nbWorlds);
+			// checkCudaErrors( cudaDeviceSynchronize() );
+			hostChildUtilTableMirror[i] = dev_tmp;
+		}
+	}
+
+	cudaEvent_t startEvent, stopEvent;
+	float ms, tot_ms = 0;
+	checkCudaErrors(cudaEventCreate(&startEvent));
+	checkCudaErrors(cudaEventCreate(&stopEvent));
+
+	//// note: MAX_DIM_GRID = TOT_GLOBAL_MEM-1
+	//// Thus, we use as block shift exclusively the rows that have been computed so far (GLOBAL MEM)
+
+	size_t cudaAggrBlocks = 0;
+	size_t cudaAggrTableRows = 0;
+	size_t cudaTableRowsLeft = 0;
+	size_t nbTableRowsToCompute = 0;
+	if (_version_ == 0 || _version_ == 1)
+		nbTableRowsToCompute = nbUtilTableRowsAfterProj;
+	else if (_version_ == 2 || _version_ == 3)
+		nbTableRowsToCompute = nbUtilTableRows;
+	do {
+		cudaTableRowsLeft = (nbTableRowsToCompute - cudaAggrTableRows);
+
+		if (devUtilTableRows > cudaTableRowsLeft)
+			devUtilTableRows = cudaTableRowsLeft;
+
+		// Update nBlocks with the current devUtilTableRows info:
+		nbBlocks =
+				(devUtilTableRows % nbGroups == 0) ?
+						(devUtilTableRows / nbGroups) :
+						(devUtilTableRows / nbGroups) + 1;
+
+		nBytesDev = devUtilTableRows * sizeof(int);
+
+		printf("[GPU] Device Util Table size: [%zu] (MB=%zu)\n",
+				devUtilTableRows, nBytesDev / (1024 * 1024));
+		printf("[GPU] Kernel: nbBlocks=%zu nbGroups=%zu nbThreads=%zu\n",
+				nbBlocks, nbGroups, nbThreads);
+
+		size_t nbBlocksCompleted = 0;
+		while (nbBlocksCompleted < nbBlocks) {
+			size_t runningNbBlocks =
+					nbBlocks > MAX_DIM_GRID ? MAX_DIM_GRID : nbBlocks;
+
+			checkCudaErrors(cudaEventRecord(startEvent, 0));
+			///cudaProfilerStart();
+
+			// ----------------------------------------------------------------------- //
+			// EXECUTE KERNEL
+			// ----------------------------------------------------------------------- //
+			if (_version_ == 0) {
+				std::cout << "Running version 0\n";
+				compute_util_table_ver_0<<< runningNbBlocks, nbThreads, sharedMem >>>
+				(devUtilTable,
+						cudaAggrTableRows + nbBlocksCompleted,
+						devUtilTableRows,
+						nbGroups,
+						dpop_state.get_agent_id(),
+						dpop_state.get_dom_size(),
+						dpop_state.get_separator().size(),
+						dpop_state.get_nb_binary_constraints());
+			}
+			else if (_version_ == 1) {
+				std::cout << "Running version 1\n";
+				// std::cout << "ch info size: " << dpop_state.get_children_info_size() << "\n";
+				// CUDAutils::dump_agent_info( dpop_state.get_agent_id() );
+				// getchar();
+				compute_util_table_ver_1<<< runningNbBlocks, nbThreads, sharedMem >>>
+				  (devUtilTable,
+				   devChildUtilTable,
+				   cudaAggrTableRows + nbBlocksCompleted,
+				   devUtilTableRows,
+				   nbGroups,
+				   dpop_state.get_agent_id(),
+				   dpop_state.get_dom_size(),
+				   dpop_state.get_separator().size(),
+				   dpop_state.get_max_children_info_size(),
+				   dpop_state.get_nb_binary_constraints(),
+				   dpop_state.get_children_info_size(),
+				   dpop_state.is_root());
+			}
+			else if (_version_ == 2) {
+				std::cout << "Running version 2\n";
+				compute_util_table_ver_2<<< runningNbBlocks, nbThreads, sharedMem >>>
+				(devUtilTable,
+						cudaAggrBlocks + nbBlocksCompleted,
+						devUtilTableRows,
+						dpop_state.get_agent_id(),
+						dpop_state.get_dom_size(),
+						dpop_state.get_separator().size() + 1,
+						dpop_state.get_nb_binary_constraints());
+			}
+			checkCudaErrors(cudaDeviceSynchronize());
+			///cudaProfilerStop();
+
+			checkCudaErrors(cudaEventRecord(stopEvent, 0));
+			checkCudaErrors(cudaEventSynchronize(stopEvent));
+			checkCudaErrors(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+			tot_ms += ms;
+
+			nbBlocksCompleted += runningNbBlocks;
+
+			// TODO: parallel copies here?
+		}
+
+		// Copy Memory Back: Device --> Host
+		checkCudaErrors(
+				cudaMemcpy(&hostUtilTable[cudaAggrTableRows], devUtilTable,
+						nBytesDev, cudaMemcpyDeviceToHost));
+		checkCudaErrors(cudaDeviceSynchronize());
+
+		cudaAggrBlocks += nbBlocks;
+		cudaAggrTableRows += devUtilTableRows;
+
+	} while (cudaAggrTableRows < nbTableRowsToCompute);
+
+	// If _version_ 2 or 3 we still need to integrate the children table (on Host)
+
+	printf("[GPU] gpu-time elapsed %f ms\n", tot_ms);
+	gpu_time_us = tot_ms * 1000;
+
+	checkCudaErrors(cudaEventDestroy(startEvent));
+	checkCudaErrors(cudaEventDestroy(stopEvent));
+	checkCudaErrors(cudaFree(devUtilTable));
+
+	if (_version_ == 1) {
+		for (int i = 0; i < dpop_state.getChildrenId().size(); i++) {
+			checkCudaErrors(cudaFree(hostChildUtilTableMirror[i]));
+		}
+		checkCudaErrors(cudaFree(devChildUtilTable));
+		delete[] hostChildUtilTableMirror;
+	}
+
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+__device__ __forceinline__
+unsigned int lcuda_encode(int* t, int t_size, int d) {
+  int _d = d;
+  unsigned int ofs = t[--t_size];
+  #pragma unroll
+  while (t_size > 0) {
+    ofs += t[--t_size] * _d;
+    _d *= d;
+  }
+  return ofs;
+}
+
+__device__ __forceinline__
+void lcuda_decode(unsigned int code, int* t, int t_size, int d) {
+  #pragma unroll
+  for (int i = t_size - 1; i >= 0; i--) {
+    t[i] = code % d;
+    code /= d;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// NOTE: 
+// Thread's private array definitely is stored at local memory space, in the DRAM off-the-chip, 
+// and maybe cached in memory hierarchy. Generally, non-array variable are considered as virtual 
+// registers in PTX and the number of registers in PTX are unlimited. However, obviously all these 
+// virtual registers are not mapped to physical registers. A PTX postprocessor spills some registers 
+// to local space according to the micro-architecture flags specified for NVCC, and optimizes the register usage.
+////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////
+// C U D A   K E R N E L S  ( UTIL Table computation )
+////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////////////
+// V E R S I O N   0   (Leaves)
+////////////////////////////////////////////////////////////////////////////////////////
+__global__ void compute_util_table_ver_0(int* utilTable,
+		unsigned int block_shift,
+		unsigned int devUtilTableRows,  // after projection
+		int nbGroups, // each group computes a row (nb_worlds)
+		int aid, int d_size, int nb_var_sep,
+		int nb_binary) {
+	// ---------------------------------------------------------------------- //
+	// Registers
+	// ---------------------------------------------------------------------- //
+	int groupIdx = threadIdx.x; // One thread = one row of utilTable
+	if (groupIdx >= nbGroups) return;
+
+	unsigned int utilTableRow = (blockIdx.x * nbGroups) + groupIdx;
+	unsigned int utilTableCode = block_shift + utilTableRow;
+
+	if (utilTableRow >= devUtilTableRows)
+		return;
+
+	// printf("Thread %zu on world %d (GroupID %d) - utilRow: %d \n", threadIdx.x, wid, groupIdx, (int)utilTableRow);
+
+	int util_di = 0;
+	int util = 0;
+	int _i = 0, _j = 0, _di = 0, _id = 0, _x1 = 0, _x2 = 0;
+	int _scope_x1, _scope_x2;
+	int _ch_sep_size = 0, _c_code;
+
+	// ---------------------------------------------------------------------- //
+	// Shared Memory Allocation
+	// ---------------------------------------------------------------------- //
+	extern __shared__ int __smem[];
+	int* __constraint = __smem; //gdev_DPOP_Agents[aid].binary_con;
+
+	if (threadIdx.x == 0) {
+			if (nb_binary > 0)
+				memcpy(__constraint, gdev_DPOP_Agents[aid].binary_con,
+						nb_binary * 3 * sizeof(int));
+	}
+
+	int* __sep_values = &__smem[nb_binary * 3 + (groupIdx * nb_var_sep)];
+	__syncthreads();
+
+	lcuda_decode(utilTableCode, __sep_values, nb_var_sep, d_size);
+	__syncthreads();
+
+	// ---------------------------------------------------------------------- //
+	// Compute Util Table Entry Value
+	util = UNSAT;
+	for (_di = 0; _di < d_size; _di++) // Reticulate across al domain elements
+	{
+		util_di = 0;
+
+		//--------------------------------------------------------------------- //
+		// Binary constraints
+		//--------------------------------------------------------------------- //
+		#pragma unroll
+		for (_i = 0; _i < nb_binary; _i++) {
+			_id = __constraint[3 * _i];
+			_x1 = __constraint[3 * _i + 1];
+			_x2 = __constraint[3 * _i + 2];
+			_scope_x1 = _x1 == -1 ? _di : __sep_values[_x1];
+			_scope_x2 = _x2 == -1 ? _di : __sep_values[_x2];
+
+			_j = gdev_Constraints[_id].utils[_scope_x1 * d_size + _scope_x2]; // (global mem)
+
+			// printf("Thread %d on world %d - constraint c_%d [%d %d] = %d\n",
+			// 	     threadIdx.x, wid, _id, _scope_x1, _scope_x2, _j);
+
+			if (_j == UNSAT) {
+				util_di = UNSAT;
+				break;
+			}
+			util_di += _j;
+		}
+
+		if (util == UNSAT || util_di > util) {
+			util = util_di;
+		}
+	}
+
+	utilTable[utilTableRow] = util; // (global mem)
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////
+// V E R S I O N   1   (Small (<2G) Util Tables (Children Table can be copied to Global Mem)
+////////////////////////////////////////////////////////////////////////////////////////
+__global__ void compute_util_table_ver_1(int* utilTable,
+					 int** childIdToUtilTablePtr,
+					 // childUtilTableRows ?
+					 unsigned int block_shift, unsigned int devUtilTableRows,
+					 int nbGroups, // each group computes a row (nb_worlds)
+					 int aid, int d_size, int nb_var_sep,
+					 int max_ch_sep_size, int nb_binary, int children_info_size,
+					 bool is_root) {
+  // ---------------------------------------------------------------------- //
+  // Registers
+  // ---------------------------------------------------------------------- //
+  int groupIdx = threadIdx.x; // Each group computes a row of utilTable
+  if (groupIdx >= nbGroups) return; // ok
+  
+  unsigned int utilTableRow = (blockIdx.x * nbGroups) + groupIdx;
+  unsigned int utilTableCode = block_shift + utilTableRow;
+  
+  if (utilTableRow >= devUtilTableRows)
+    return;
+  
+  int util_di = 0;
+  int util = 0;
+  int _util_tmp = 0;
+  int best_di = 0; // only used by root.  
+  int _i = 0, _j = 0, _k = 0, _di = 0, _id = 0, _x1 = 0, _x2 = 0;
+  int _scope_x1, _scope_x2;
+  int _ch_sep_size = 0, _c_code;
+  
+  // ---------------------------------------------------------------------- //
+  // Shared Memory Allocation
+  // ---------------------------------------------------------------------- //
+  extern __shared__ int __smem[];
+  
+  _j = 0;
+  int* __sep_values = &__smem[_j + (groupIdx * nb_var_sep)]; // 1 group  (one for each groups)
+  _j += nbGroups * nb_var_sep;
+  int* __sep_value_child = &__smem[_j + (threadIdx.x * max_ch_sep_size)]; // 1 thread (one for each thread)
+  _j += blockDim.x * max_ch_sep_size;  
+  int* __util_vector = &__smem[_j + (threadIdx.x * d_size)];
+
+  int* g_constraint = gdev_DPOP_Agents[aid].binary_con;
+  int* g_children_info = gdev_DPOP_Agents[aid].children_info;
+  __syncthreads();
+  
+  lcuda_decode(utilTableCode, __sep_values, nb_var_sep, d_size);
+  __syncthreads();
+  
+  // ---------------------------------------------------------------------- //
+  // Compute Util Table Entry Value
+  // ---------------------------------------------------------------------- //
+  for (_i = 0; _i < d_size; _i++) __util_vector[_i] = 0;
+
+
+  //--------------------------------------------------------------------- //
+  // Binary constraints
+  //--------------------------------------------------------------------- //
+  for (_i = 0; _i < nb_binary; _i++) {
+    _id = g_constraint[3 * _i];      // O(1)
+    _x1 = g_constraint[3 * _i + 1];  // .
+    _x2 = g_constraint[3 * _i + 2];  // .
+
+    // todo: Try to copy this in shared mem
+    int* g_con_utils = gdev_Constraints[_id].utils;  // O(T)
+
+    #pragma unroll
+    for (_di = 0; _di < d_size; _di++) // Reticulate across al domain elements
+      {
+	_scope_x1 = _x1 == -1 ? _di : __sep_values[_x1];  // O(1)
+	_scope_x2 = _x2 == -1 ? _di : __sep_values[_x2];  // O(1)
+
+	// Two solutions to speed up this step:
+	// 1. Align: if x1==-1 -> need transpose, so that threads can copy more data.
+	// 2. Use d_size threads (BEST solution) Each thread read one cell and adds 
+	_util_tmp = g_con_utils[_scope_x1 * d_size + _scope_x2]; // O(T) (global mem)
+	__util_vector[_di] += _util_tmp; // O(1)
+      }
+  }
+
+  //--------------------------------------------------------------------- //
+  // Messages from Children
+  //--------------------------------------------------------------------- //
+  _i = 0;
+  //#pragma unroll
+  while (_i < children_info_size) {
+    _id = g_children_info[_i++]; // O(1)
+    _ch_sep_size = g_children_info[_i++];  // O(1);
+    
+    if (_ch_sep_size <= 0)
+      continue;
+    _k = _i;
+
+    int* g_child_utils = childIdToUtilTablePtr[_id]; // O(1)
+#pragma unroll
+    for (_di = 0; _di < d_size; _di++) // Reticulate across al domain elements
+      {
+	_i = _k;
+        #pragma unroll
+	for (_j = 0; _j < _ch_sep_size; _j++) {
+	  // index of sep_values (-1 if current agent)
+	  // This one is read d_size times. 
+	  // Two solutions to speed it up: 
+	  // 1. Save it once in shared - reuse it for each _di
+	  // 2. Use d_size threads.
+	  _x1 = g_children_info[_i++];  // O(1)
+	  __sep_value_child[_j] = (_x1 == -1) ? _di : __sep_values[_x1]; // O(1)
+	}
+
+	// Infer something rather than encoding for each element of di??
+	_x2/*_ch_row*/= lcuda_encode(__sep_value_child, _ch_sep_size, d_size);  
+	_util_tmp = g_child_utils[_x2]; 
+	
+	__util_vector[_di] += _util_tmp;
+      }
+  }
+
+
+  // get best util:
+  util = UNSAT;
+#pragma unroll
+  for (_di = 0; _di < d_size; _di++)
+    util = fmax((double)util, (double)__util_vector[_di]);
+
+  utilTable[utilTableRow] = util; // (global mem)
+  
+  
+  if (is_root) {
+    for (_di = 0; _di < d_size; _di++)
+      best_di = util == __util_vector[_di] ? _di : best_di;
+  //		util    = (/*util == UNSAT || */util_di > util) ? util_di : util;
+  //		best_di = (/*util == UNSAT || */util_di > util) ? _di : best_di;  
+    gdev_DPOP_Agents[aid].best_value = best_di; //  (global mem)
+    gdev_DPOP_Agents[aid].best_util = util; // (global mem)
+  }
+  
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+// V E R S I O N   2   (Very Large (>2GB) Util Tables)
+////////////////////////////////////////////////////////////////////////////////////////
+// Deals with a non-projected UTIL table. Each tread computes one row of the table
+// (all worlds associated to it).
+// One group computes 256 rows.
+__global__ void compute_util_table_ver_2(int* devUtilTable,
+		unsigned int blockShift,
+		unsigned int devUtilTableRows,  // size after projection
+		int aid, int domSize, int nbVarSep,
+		int nbBinary) {
+	// ---------------------------------------------------------------------- //
+	// Registers
+	// ---------------------------------------------------------------------- //
+	unsigned int utilTableRow = threadIdx.x + blockIdx.x * blockDim.x; // Table Current In Memory
+	unsigned int utilTableCode = blockShift + utilTableRow; // Global Table
+
+	// Cannot compute a row that does not exists.
+	if (utilTableRow >= devUtilTableRows)
+		return;
+
+	int _util = 0, __worldsUtil, _i = 0, _id = 0, _x1 = 0, _x2 = 0, _scope_x1 = 0, _scope_x2 = 0;
+	// ---------------------------------------------------------------------- //
+	// Shared Memory Allocation
+	// ---------------------------------------------------------------------- //
+	extern __shared__ int __smem[];
+	int* __constraint = __smem;
+	_i = nbBinary * 3;
+	int* __sepValues = &__smem[_i + (threadIdx.x * nbVarSep)];
+	_i += blockDim.x * nbVarSep;
+	__syncthreads();
+
+	if (nbBinary > 0 && threadIdx.x == 0) {
+		memcpy(__constraint, gdev_DPOP_Agents[aid].binary_con,
+				(nbBinary * 3 * sizeof(int)));
+	}
+
+	lcuda_decode(utilTableCode, __sepValues, nbVarSep, domSize);
+	__syncthreads();
+
+	// ---------------------------------------------------------------------- //
+	// Compute Util Table Entry Value
+	_util = -1;
+	__worldsUtil = 0;
+	//--------------------------------------------------------------------- //
+	// Binary constraints
+	//--------------------------------------------------------------------- //
+	#pragma unroll
+	for (_i = 0; _i < nbBinary; _i++) {
+		_id = __constraint[3 * _i];
+		_x1 = __constraint[3 * _i + 1];
+		_x2 = __constraint[3 * _i + 2];
+		// This variable domain are stored in the last position of the UtilTable before projection
+		_scope_x1 =
+				_x1 == -1 ? __sepValues[nbVarSep - 1] : __sepValues[_x1];
+		_scope_x2 =
+				_x2 == -1 ? __sepValues[nbVarSep - 1] : __sepValues[_x2];
+
+		_util =
+				gdev_Constraints[_id].utils[_scope_x1 * domSize + _scope_x2]; // (global mem)
+			// printf("Thread %d on world %d -> row: %d constraint c_%d [%d %d] = %d\n",
+			//  	     threadIdx.x, _wid, utilTableCode, _id, _scope_x1, _scope_x2, _util);
+
+		if (_util == UNSAT) {
+			__worldsUtil = UNSAT;
+			break;
+		}
+		__worldsUtil += _util;
+	}
+
+	devUtilTable[utilTableRow] = __worldsUtil; // (global mem)
+
+	// delete[] __worldsUtil;
+}
+
+// @Deprecated
+__global__ void project_util_table(int *devUtilTable,
+		unsigned int nbUtilTableRows, int domSize) {
+
+	// Thread 0 -> take first (domSize rows) and all worlds
+	unsigned int _start_table_row = threadIdx.x * domSize + blockIdx.x * blockDim.x * domSize;
+	unsigned int _end_table_row = _start_table_row + domSize - 1;
+	if (_end_table_row > nbUtilTableRows)
+		return; // This should never happen
+	// unsigned int _table_row_after_proj = threadIdx.x + blockIdx.x * blockDim.x;
+
+	int _util_di, _best_util, _w, _d;
+
+	_best_util = UNSAT;
+	_util_di = UNSAT;
+
+	#pragma unroll
+	for (_d = 0; _d < domSize; _d++) {
+		_util_di = devUtilTable[_start_table_row + _d];
+		if (_util_di != UNSAT && _util_di > _best_util)
+			_best_util = _util_di;
+	}
+	devUtilTable[_start_table_row] = _best_util;
+}
+

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings>
+  <DCOPsolver preprocess="standard" schema="DPOP">
+    <solver agent="*" strategy="bb"></solver>
+  </DCOPsolver>
+  <metrics>
+    <metric name="innerMessageCost">0</metric>
+    <metric name="outerMessageCost">0</metric>
+    <!-- Not really used -->
+    <metric name="simulatedTime">active</metric>
+    <metric name="wallclockTime">active</metric>
+    <metric name="NCCCs">active</metric>
+  </metrics>
+  <timeouts>
+    <timeout metric="simulatedTime">300000</timeout>
+    <!-- <timeout metric="wallclockTime">600</timeout> -->
+    <!-- 2GB -->
+    <timeout metric="memory">2000000000</timeout>
+    <!-- <timeout metric="NCCCs">2000000000</timeout> -->
+  </timeouts>
+</settings>
