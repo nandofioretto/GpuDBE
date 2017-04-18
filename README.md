@@ -2,7 +2,7 @@
 
 This repository contains the sources of a GPU Distributed Bucket Elimination (GpuBE). For details, please refer to our paper:
 
-Ferdinando Fioretto, Tiep Le, Enrico Pontelli, William Yeoh, Tran Cao Son
+- Ferdinando Fioretto, Tiep Le, Enrico Pontelli, William Yeoh, Tran Cao Son
 [Exploiting GPUs in Solving (Distributed) Constraint Optimization Problems with Dynamic Programming](http://link.springer.com/chapter/10.1007%2F978-3-319-23219-5_9), In proceeding of CP 2015.
 
 
