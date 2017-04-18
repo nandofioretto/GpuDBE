@@ -1,4 +1,4 @@
-# GpuBE 
+# GpuDBE-CP15
 
 This repository contains the sources of a GPU Distributed Bucket Elimination (GpuBE). For details, please refer to our paper:
 
