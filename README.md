@@ -1,6 +1,24 @@
-=================
-Execution
-================
+# GpuBE 
+
+This repository contains the sources of a GPU Distributed Bucket Elimination (GpuBE). For details, please refer to our paper:
+
+Ferdinando Fioretto, Tiep Le, Enrico Pontelli, William Yeoh, Tran Cao Son
+[Exploiting GPUs in Solving (Distributed) Constraint Optimization Problems with Dynamic Programming](http://link.springer.com/chapter/10.1007%2F978-3-319-23219-5_9), In proceeding of CP 2015.
+
+
+### Compiling 
+GpuDBE has been tested on MAC-OS-X and Linux operating systems. Prior compiling, you need to set up the following parameters in the Makefile:
+
+	DEVICE_CC		(The device compute capability of the GPU)
+	CUDA_PATH   	(The path to the CUDA libraries) 
+	cudaDBE_PATH	(The path to GpuBE)
+
+Then, from the GpuBE folder execute:
+
+	make 
+
+
+### Execution
 	./cudaDBE fileIn.xml [device=]devId [root=]rootId [memlimitMB=|memlimitGB=]mem
 
 	The parameters in brackets are optionals.
@@ -14,9 +32,7 @@ Execution
          (this paramter can also be set through the preference.hh file with the maxDevMemory option).
 
 
-=================
-Preferences
-================
+### Preferences
 	Print and Report preferences (boolean)
 	- verbose:        Verbose report
 	- verboseDevInit: Reports device intialization procedures   
@@ -37,4 +53,25 @@ Preferences
 	- maxDevMemory:         Defines the maximum global memory allowed on the device. Leave '0' for using the 
                          maximal device global memory capabilities.
 
- 
+
+
+## References
+- [1] Ferdinando Fioretto and Tiep Le and William Yeoh and Enrico Pontelli and Tran Cao Son. "[Exploiting {GPU}s in Solving (Distributed) Constraint Optimization Problems with Dynamic Programming](http://www-personal.umich.edu/~fioretto/files/papers/cp15.pdf)". In Proceedings of the International Conference on Principles and Practice of Constraint Programming (CP), pages 121-139, 2017. 
+
+
+## Citing
+```
+@inproceedings{fioretto:CP-15,
+  author    = "Ferdinando Fioretto and Tiep Le and William Yeoh and Enrico Pontelli and Tran Cao Son",
+  title     = "Exploiting {GPU}s in Solving (Distributed) Constraint Optimization Problems with Dynamic Programming",
+  booktitle = "Proceedings of the International Conference on Principles and Practice of Constraint Programming {(CP)}",
+  year      = "2015",
+  pages     = "121--139",
+  doi       = "10.1007/978-3-319-23219-5_9"
+}
+```
+
+## Contacts
+- Ferdinando Fioretto: fioretto@umich.edu
+- William Yeoh: wyeoh@cs.nmsu.edu
+- Enrico Pontelli: epontell@cs.nmsu.edu
